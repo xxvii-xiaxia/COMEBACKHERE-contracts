@@ -4,11 +4,13 @@ mod events;
 mod invoice;
 mod validation;
 
+pub use events::InvoiceAmountUpdatedEvent;
 pub use invoice::{DataKey, Invoice, InvoiceError, InvoiceStatus, MaybeAddress, MaybeBytes};
 
 use soroban_sdk::{contract, contractimpl, Address, Env, Vec};
 use validation::{
-    require_admin, require_not_paused, require_positive_amount, require_usdc_precision,
+    require_admin, require_expiry_not_too_long, require_not_paused, require_positive_amount,
+    require_usdc_precision,
 };
 
 #[contract]
@@ -72,6 +74,7 @@ impl InvoiceContract {
         if expires_in_seconds == 0 {
             return Err(InvoiceError::ZeroDuration);
         }
+        require_expiry_not_too_long(expires_in_seconds)?;
 
         // #58: reject duplicate merchant nonce
         if merchant_nonce != 0 {
@@ -111,6 +114,17 @@ impl InvoiceContract {
             .persistent()
             .set(&DataKey::Invoice(id), &invoice);
         env.storage().instance().set(&DataKey::InvoiceCount, &id);
+
+        // #9: maintain merchant invoice index
+        let idx_key = DataKey::MerchantInvoices(merchant.clone());
+        let mut ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&idx_key)
+            .unwrap_or(Vec::new(&env));
+        ids.push_back(id);
+        env.storage().persistent().set(&idx_key, &ids);
+
         events::invoice_created(&env, id, &invoice);
         Ok(id)
     }
@@ -120,6 +134,7 @@ impl InvoiceContract {
         admin: Address,
         id: u64,
         payer: Address,
+        provided_metadata_hash: MaybeBytes,
     ) -> Result<(), InvoiceError> {
         require_admin(&env, &admin)?;
         require_not_paused(&env)?;
@@ -132,6 +147,12 @@ impl InvoiceContract {
 
         if invoice.status != InvoiceStatus::Pending {
             return Err(InvoiceError::NotPending);
+        }
+
+        if provided_metadata_hash != MaybeBytes::None
+            && provided_metadata_hash != invoice.metadata_hash
+        {
+            return Err(InvoiceError::MetadataMismatch);
         }
 
         // #55: apply grace window — payment is valid up to expires_at + grace_window
@@ -267,6 +288,62 @@ impl InvoiceContract {
             .persistent()
             .set(&DataKey::Invoice(id), &invoice);
         events::invoice_refund_requested(&env, id, &invoice);
+        Ok(())
+    }
+
+    // --- #9: paginated merchant invoice index read ---
+
+    /// Return a page of invoice IDs for `merchant`.
+    /// `start` is a zero-based offset; `limit` caps the returned slice.
+    pub fn get_invoices_by_merchant(
+        env: Env,
+        merchant: Address,
+        start: u32,
+        limit: u32,
+    ) -> Vec<u64> {
+        let ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MerchantInvoices(merchant))
+            .unwrap_or(Vec::new(&env));
+        let total = ids.len();
+        let start = start.min(total);
+        let end = (start + limit).min(total);
+        let mut page = Vec::new(&env);
+        for i in start..end {
+            page.push_back(ids.get(i).unwrap());
+        }
+        page
+    }
+
+    // --- #15: two-step admin transfer ---
+
+    /// Initiate admin transfer. Current admin nominates `new_admin`.
+    pub fn transfer_admin(
+        env: Env,
+        admin: Address,
+        new_admin: Address,
+    ) -> Result<(), InvoiceError> {
+        require_admin(&env, &admin)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingAdmin, &new_admin);
+        Ok(())
+    }
+
+    /// Complete admin transfer. Must be called by the pending admin.
+    pub fn accept_admin(env: Env, new_admin: Address) -> Result<(), InvoiceError> {
+        new_admin.require_auth();
+        let pending: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .ok_or(InvoiceError::NoPendingAdmin)?;
+        if pending != new_admin {
+            return Err(InvoiceError::Unauthorized);
+        }
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        env.storage().instance().remove(&DataKey::PendingAdmin);
         Ok(())
     }
 
